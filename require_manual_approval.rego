@@ -1,30 +1,22 @@
-# All deploy jobs on production branches require manual approval [from qa team]
+# All deploy jobs [on production branches] require manual approval [from qa team]
+# All uat jobs [on production branches] require manual approval [from pm team]
 
 package org
 
 import future.keywords
-import data.circleci.config
+# import data.circleci.config
 
 policy_name["require_manual_approval"]
 
-enable_rule["require_manual_approval"] if data.meta.branch in production_branches
+enable_rule["require_manual_approval"] # if data.meta.branch in production_branches
 
-hard_fail["require_manual_approval"] {
-    require_manual_approval
+hard_fail["require_manual_approval"]
+
+# todo: add matching deploy context to reason
+require_manual_approval = {reason |
+    some job in non_compliant_jobs
+    reason := sprintf("%s job uses a production context. Manual approval required.", [job])
 }
-
-require_manual_approval = [reason] {
-    some workflow, job in config.workflows.[workflow].jobs.[job]
-    some context in job.contexts.[context]
-    context in deploy_contexts
-    job.requires.[_].type == "approval"
-    reason := sprintf("%s job in %s workflow uses production context %s. Manual approval required."
-        job.name, workflow.name, context)
-}
-
-# 
-
-import future.keywords
 
 workflows = {{"name": workflow_name, "jobs": jobs} |
 	some workflow in input.workflows[workflow_name]
@@ -54,6 +46,7 @@ approval_jobs := {{"name": job.name, "workflow": workflow.name} |
 }
 
 # todo:
+#   remove intermediate body key
 # 	scope lookup sets to inside comprehension
 # 	restrict matches to same workflow
 #   add is_deploy_context(job.body.context)
@@ -68,3 +61,14 @@ non_compliant_jobs := {job |
     some job in deploy_context_jobs
     not job in cj_names
 }
+
+# sites := [
+#     {"name": "prod"},
+#     {"name": "smoke1"},
+#     {"name": "dev"}
+# ]
+
+# q contains name if {
+#     some site in sites
+#     name := site.name
+# }

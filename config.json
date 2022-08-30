@@ -1,0 +1,403 @@
+{
+  "version": 2.1,
+  "orbs": {
+    "browser-tools": "circleci/browser-tools@1.3.0",
+    "kubernetes": "circleci/kubernetes@0.11.0",
+    "gcp-gcr": "circleci/gcp-gcr@0.15.0",
+    "gcp-gke": "circleci/gcp-gke@1.4.0",
+    "docker": "circleci/docker@1.0.1",
+    "win": "circleci/windows@2.2.0"
+  },
+  "jobs": {
+    "build": {
+      "parameters": {
+        "gover": {
+          "description": "The version of the Go compiler to use.",
+          "type": "string"
+        }
+      },
+      "docker": [
+        {
+          "image": "cimg/go:<< parameters.gover >>"
+        }
+      ],
+      "steps": [
+        "checkout",
+        {
+          "restore_cache": {
+            "keys": [
+              "go-mod-v2-{{ checksum \"go.sum\" }}"
+            ]
+          }
+        },
+        {
+          "run": "mkdir -p tmp/<< parameters.gover >>"
+        },
+        {
+          "run": "CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o tmp/<< parameters.gover >>/circleci"
+        },
+        {
+          "save_cache": {
+            "key": "go-mod-v2-{{ checksum \"go.sum\" }}",
+            "paths": [
+              "/go/pkg/mod"
+            ]
+          }
+        },
+        {
+          "persist_to_workspace": {
+            "root": "tmp",
+            "paths": [
+              "<< parameters.gover >>/circleci"
+            ]
+          }
+        }
+      ]
+    },
+    "test": {
+      "parameters": {
+        "gover": {
+          "description": "The version of the Go compiler to use.",
+          "type": "string"
+        }
+      },
+      "docker": [
+        {
+          "image": "cimg/go:<< parameters.gover >>-browsers"
+        }
+      ],
+      "parallelism": 2,
+      "steps": [
+        "checkout",
+        "browser-tools/install-chrome",
+        {
+          "restore_cache": {
+            "keys": [
+              "go-mod-v2-{{ checksum \"go.sum\" }}"
+            ]
+          }
+        },
+        {
+          "run": "mkdir -p tmp/test"
+        },
+        {
+          "run": {
+            "command": "PACKAGE_NAMES=$(go list ./... | circleci tests split --split-by=timings)\ngotestsum --junitfile tmp/test/gotestsum-report.xml -- $PACKAGE_NAMES\n"
+          }
+        },
+        {
+          "run": "cp -r templates tmp/"
+        },
+        {
+          "save_cache": {
+            "key": "go-mod-v2-{{ checksum \"go.sum\" }}",
+            "paths": [
+              "/go/pkg/mod"
+            ]
+          }
+        },
+        {
+          "store_artifacts": {
+            "path": "tmp/test"
+          }
+        },
+        {
+          "store_artifacts": {
+            "path": "tmp/templates"
+          }
+        },
+        {
+          "store_test_results": {
+            "path": "tmp/test"
+          }
+        }
+      ]
+    },
+    "build-windows": {
+      "executor": {
+        "name": "win/default",
+        "size": "medium"
+      },
+      "steps": [
+        "checkout",
+        {
+          "run": {
+            "command": "go build -o circleci",
+            "shell": "bash --login -eo pipefail"
+          }
+        },
+        {
+          "store_artifacts": {
+            "path": "circleci",
+            "destination": "circleci"
+          }
+        }
+      ]
+    },
+    "security-sast": {
+      "docker": [
+        {
+          "image": "securego/gosec:latest"
+        }
+      ],
+      "steps": [
+        "checkout",
+        {
+          "run": "gosec -fmt junit-xml -out junit.xml ./..."
+        },
+        {
+          "store_test_results": {
+            "path": "."
+          }
+        }
+      ]
+    },
+    "create-gke-deployment": {
+      "executor": "gcp-gcr/default",
+      "parameters": {
+        "tag": {
+          "description": "Tag to use for image.\n",
+          "type": "string"
+        },
+        "cluster-name": {
+          "description": "Name of the GKE cluster\n",
+          "type": "string"
+        },
+        "namespace": {
+          "description": "The deployment namespace.\n",
+          "type": "string",
+          "default": ""
+        },
+        "container": {
+          "description": "The deployment container including the registry and path.\n",
+          "type": "string"
+        }
+      },
+      "environment": {
+        "IMAGE": "<< parameters.container >>"
+      },
+      "steps": [
+        "checkout",
+        {
+          "run": "cat k8s/deployment.yml | envsubst > k8s/deployment-final.yml"
+        },
+        "gcp-gcr/gcr-auth",
+        "gcp-gke/install",
+        {
+          "run": "gcloud container clusters get-credentials << parameters.cluster-name >> --region $GOOGLE_COMPUTE_REGION"
+        },
+        {
+          "kubernetes/create-or-update-resource": {
+            "get-rollout-status": true,
+            "namespace": "<< parameters.namespace >>",
+            "resource-file-path": "k8s/deployment-final.yml",
+            "resource-name": "deployment/demo-app"
+          }
+        },
+        {
+          "when": {
+            "condition": "<< parameters.namespace >>",
+            "steps": [
+              {
+                "run": "kubectl -n << parameters.namespace >> get svc"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "gcr-build-and-push": {
+      "executor": "gcp-gcr/default",
+      "parameters": {
+        "tag": {
+          "description": "Tag to use for image.\n",
+          "type": "string"
+        },
+        "registry": {
+          "description": "Registry to use for image.\n",
+          "type": "string",
+          "default": "gcr.io"
+        },
+        "image": {
+          "description": "Image name.\n",
+          "type": "string"
+        }
+      },
+      "steps": [
+        "checkout",
+        {
+          "attach_workspace": {
+            "at": "/home/circleci/project"
+          }
+        },
+        "gcp-gcr/gcr-auth",
+        {
+          "gcp-gcr/build-image": {
+            "image": "<< parameters.image >>",
+            "tag": "<< parameters.tag >>",
+            "registry-url": "<< parameters.registry >>"
+          }
+        },
+        {
+          "gcp-gcr/push-image": {
+            "tag": "<< parameters.tag >>",
+            "image": "<< parameters.image >>",
+            "registry-url": "<< parameters.registry >>"
+          }
+        }
+      ]
+    }
+  },
+  "workflows": {
+    "version": 2,
+    "production_flow": {
+      "jobs": [
+        {
+          "security-sast": {
+            "filters": {
+              "branches": {
+                "only": "/^(master|staging)$/"
+              }
+            }
+          }
+        },
+        {
+          "build": {
+            "filters": {
+              "branches": {
+                "only": "/^(master|staging)$/"
+              }
+            },
+            "matrix": {
+              "parameters": {
+                "gover": [
+                  "1.18",
+                  "1.17"
+                ]
+              }
+            },
+            "requires": [
+              "security-sast"
+            ]
+          }
+        },
+        {
+          "test": {
+            "filters": {
+              "branches": {
+                "only": "/^(master|staging)$/"
+              }
+            },
+            "matrix": {
+              "parameters": {
+                "gover": [
+                  "1.18",
+                  "1.17"
+                ]
+              }
+            },
+            "requires": [
+              "build"
+            ]
+          }
+        },
+        {
+          "gcr-build-and-push": {
+            "filters": {
+              "branches": {
+                "only": "/^(master|staging)$/"
+              }
+            },
+            "context": [
+              "cloudSecrets",
+              "gcr"
+            ],
+            "tag": "$CIRCLE_SHA1",
+            "image": "demo-app",
+            "requires": [
+              "test"
+            ]
+          }
+        },
+        {
+          "hold-gke-deployment": {
+            "requires": [
+              "gcr-build-and-push"
+            ],
+            "type": "approval"
+          }
+        },
+        {
+          "create-gke-deployment": {
+            "filters": {
+              "branches": {
+                "only": "/^(master|staging)$/"
+              }
+            },
+            "namespace": "",
+            "tag": "$CIRCLE_SHA1",
+            "context": "cloudSecrets",
+            "cluster-name": "demo-cluster",
+            "container": "gcr.io/olukotun-demo/demo-app",
+            "requires": [
+              "hold-gke-deployment"
+            ]
+          }
+        }
+      ]
+    },
+    "feature_branch_flow": {
+      "jobs": [
+        "security-sast2",
+        {
+          "security-sast": {
+            "filters": {
+              "branches": {
+                "ignore": "/^(master|staging)$/"
+              }
+            }
+          }
+        },
+        {
+          "build": {
+            "filters": {
+              "branches": {
+                "ignore": "/^(master|staging)$/"
+              }
+            },
+            "matrix": {
+              "parameters": {
+                "gover": [
+                  "1.18"
+                ]
+              }
+            },
+            "requires": [
+              "security-sast"
+            ]
+          }
+        },
+        {
+          "test": {
+            "filters": {
+              "branches": {
+                "ignore": "/^(master|staging)$/"
+              }
+            },
+            "matrix": {
+              "parameters": {
+                "gover": [
+                  "1.18"
+                ]
+              }
+            },
+            "requires": [
+              "build"
+            ]
+          }
+        }
+      ]
+    }
+  }
+}
+
